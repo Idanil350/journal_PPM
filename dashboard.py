@@ -10,6 +10,7 @@ import pdfplumber
 import streamlit as st
 from dotenv import load_dotenv
 
+import db
 from ppm_extraction import (
     ATTRIBUTION_COLUMN,
     PPMAnalytics,
@@ -98,6 +99,8 @@ st.caption(
     "pertinentes et lire la Business Intelligence associée."
 )
 
+collection = db.get_collection()
+
 with st.sidebar:
     st.caption("Filtres")
     hide_past = st.toggle(
@@ -109,6 +112,18 @@ with st.sidebar:
              "l'opportunité de soumissionner est perdue. Les dates vides ou illisibles "
              "sont conservées par prudence.",
     )
+    show_new_only = st.toggle(
+        "Nouveaux et modifiés uniquement",
+        value=True,
+        disabled=collection is None or "ppm_results" not in st.session_state,
+        help="Compare avec les éditions précédentes du PPM déjà chargées : masque les "
+             "marchés déjà vus et inchangés depuis la dernière fois.",
+    )
+    if collection is None:
+        st.caption(
+            ":material/info: Mémoire entre éditions désactivée -- configure MONGO_URI "
+            "pour comparer avec les journaux déjà chargés.",
+        )
     st.caption("DAREDAB · outil d'extraction PPM")
 
 uploaded_file = st.file_uploader("Journal de programmation des marchés (PDF)", type=["pdf"])
@@ -168,6 +183,27 @@ if hide_past:
         )
         st.stop()
 
+# Comparaison avec les éditions précédentes du PPM déjà chargées -- appliquée
+# APRÈS le filtrage IT/en-cours, jamais sur le contenu lui-même. Sans base
+# configurée, tout est marqué "Nouveau" par défaut (comportement identique à
+# avant l'ajout de cette mémoire).
+new_count = updated_count = None
+if collection is not None:
+    results = db.classify_and_store(collection, results)
+    new_count = sum(1 for r in results if r["Statut"] == db.STATUS_NEW)
+    updated_count = sum(1 for r in results if r["Statut"] == db.STATUS_UPDATED)
+    if show_new_only:
+        before_new_filter = len(results)
+        results = [r for r in results if r["Statut"] in (db.STATUS_NEW, db.STATUS_UPDATED)]
+        if not results:
+            st.info(
+                f"Les {before_new_filter} marché(s) IT retenus sont déjà connus et inchangés "
+                "depuis la dernière édition chargée. Désactive le filtre dans la barre latérale "
+                "pour les revoir.",
+                icon=":material/task_alt:",
+            )
+            st.stop()
+
 analytics = PPMAnalytics(results)
 kpis = analytics.kpis()
 
@@ -176,6 +212,8 @@ with st.container(horizontal=True):
     st.metric("Marchés IT retenus", kpis["lignes"], border=True)
     st.metric("Autorités distinctes", kpis["autorites"], border=True)
     st.metric("Budget total identifié", fmt_fcfa(kpis["budget_total"]), border=True)
+    if new_count is not None:
+        st.metric("Nouveaux depuis la dernière édition", new_count, border=True)
 
 if hide_past and hidden_count:
     st.caption(f":material/schedule: {hidden_count} marché(s) déjà attribué(s) masqué(s).")
@@ -189,10 +227,13 @@ with tab_data:
     with st.container(border=True):
         st.subheader("Résultats")
         df = results_to_dataframe(results)
+        if new_count is not None:
+            df.insert(0, "Statut", [r["Statut"] for r in results])
         st.dataframe(
             df,
             hide_index=True,
             column_config={
+                "Statut": st.column_config.TextColumn(pinned=True),
                 "Désignation et localisation du projet": st.column_config.TextColumn(pinned=True),
                 "Montant prévisionnel (FCFA)": st.column_config.NumberColumn(format="%d"),
             },
