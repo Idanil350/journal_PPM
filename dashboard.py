@@ -155,7 +155,6 @@ if uploaded_file is not None:
             st.session_state["ppm_total_pages"] = total_pages
         finally:
             tmp_path.unlink(missing_ok=True)
-        st.rerun()
 
 # Les résultats vivent dans session_state, indépendamment du widget d'upload
 # -- rechoisir/effacer le fichier ne fait pas disparaître la dernière analyse.
