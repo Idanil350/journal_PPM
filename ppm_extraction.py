@@ -24,6 +24,7 @@ Usage en CLI :
 """
 
 import argparse
+import gc
 import logging
 import re
 import sys
@@ -302,64 +303,82 @@ def clean_cell(value) -> str:
 # Extraction du PDF
 # ---------------------------------------------------------------------------
 
-def extract_pdf(pdf_path, progress_every: int = 100, on_progress=None):
-    """Parcourt le PDF page par page (sans jamais garder tout le document en
-    memoire) et retourne la liste des lignes de marche dont le texte contient
-    au moins un mot-cle cible.
+def extract_pdf(pdf_path, progress_every: int = 100, on_progress=None, batch_size: int = 150):
+    """Parcourt le PDF page par page et retourne la liste des lignes de
+    marché dont le texte contient au moins un mot-clé cible.
+
+    Traite le document par lots de `batch_size` pages, en refermant et
+    rouvrant le PDF entre chaque lot -- `page.flush_cache()` seul ne suffit
+    pas sur un très gros document : le cache de polices/objets embarqués de
+    pdfminer est au niveau du DOCUMENT entier, pas de la page, et grossit
+    sur toute la durée du parcours. Vérifié en direct : sans ce découpage,
+    le processus montait à ~1,7 Go de RAM sur les 1770 pages du PPM réel,
+    au-delà de la limite gratuite (~1 Go) de Streamlit Community Cloud --
+    l'app plantait (tuée par manque de mémoire) sans erreur Python visible.
 
     `on_progress(page_number, total_pages, rows_found_so_far)`, si fourni,
-    est appele tous les `progress_every` pages (et sur la derniere) -- permet
-    a une interface (CLI ou Streamlit) de piloter sa propre barre de
+    est appelé tous les `progress_every` pages (et sur la dernière) -- permet
+    à une interface (CLI ou Streamlit) de piloter sa propre barre de
     progression sans dupliquer la boucle d'extraction."""
     results = []
     total_rows_seen = 0
 
     with pdfplumber.open(pdf_path) as pdf:
         total_pages = len(pdf.pages)
-        logger.info(f"Ouverture du PDF : {total_pages} pages a analyser.")
+    logger.info(f"Ouverture du PDF : {total_pages} pages a analyser.")
 
-        for page_index, page in enumerate(pdf.pages):
-            page_number = page_index + 1
-            page_text = page.extract_text() or ""
-            buyer_header = extract_buyer_header(page_text)
+    batch_start = 0
+    while batch_start < total_pages:
+        batch_end = min(batch_start + batch_size, total_pages)
 
-            for table in page.extract_tables():
-                if not table or len(table) < 2:
-                    continue
-                for row in table[1:]:
-                    if not row or all(c is None or str(c).strip() == "" for c in row):
+        with pdfplumber.open(pdf_path) as pdf:
+            for page_index in range(batch_start, batch_end):
+                page = pdf.pages[page_index]
+                page_number = page_index + 1
+                page_text = page.extract_text() or ""
+                buyer_header = extract_buyer_header(page_text)
+
+                for table in page.extract_tables():
+                    if not table or len(table) < 2:
                         continue
-                    total_rows_seen += 1
-                    cleaned_row = [clean_cell(c) for c in row]
-                    if len(cleaned_row) < len(TABLE_COLUMNS):
-                        cleaned_row += [""] * (len(TABLE_COLUMNS) - len(cleaned_row))
-                    elif len(cleaned_row) > len(TABLE_COLUMNS):
-                        cleaned_row = cleaned_row[: len(TABLE_COLUMNS)]
+                    for row in table[1:]:
+                        if not row or all(c is None or str(c).strip() == "" for c in row):
+                            continue
+                        total_rows_seen += 1
+                        cleaned_row = [clean_cell(c) for c in row]
+                        if len(cleaned_row) < len(TABLE_COLUMNS):
+                            cleaned_row += [""] * (len(TABLE_COLUMNS) - len(cleaned_row))
+                        elif len(cleaned_row) > len(TABLE_COLUMNS):
+                            cleaned_row = cleaned_row[: len(TABLE_COLUMNS)]
 
-                    row_text = " ".join(cleaned_row)
-                    categories, uses_generic_term = detect_categories(row_text)
-                    if not categories:
-                        continue
+                        row_text = " ".join(cleaned_row)
+                        categories, uses_generic_term = detect_categories(row_text)
+                        if not categories:
+                            continue
 
-                    record = dict(zip(TABLE_COLUMNS, cleaned_row))
-                    record["Page PDF"] = page_number
-                    record["Autorité (en-tête de page)"] = buyer_header
-                    record["Type d'acheteur"] = classify_buyer_type(buyer_header)
-                    record["Catégories détectées"] = ", ".join(categories)
-                    record["À relire (terme générique)"] = "Oui" if uses_generic_term else ""
-                    results.append(record)
+                        record = dict(zip(TABLE_COLUMNS, cleaned_row))
+                        record["Page PDF"] = page_number
+                        record["Autorité (en-tête de page)"] = buyer_header
+                        record["Type d'acheteur"] = classify_buyer_type(buyer_header)
+                        record["Catégories détectées"] = ", ".join(categories)
+                        record["À relire (terme générique)"] = "Oui" if uses_generic_term else ""
+                        results.append(record)
 
-            # Sur 1770+ pages, ne pas liberer le cache interne de pdfplumber
-            # fait grossir la memoire au fil du parcours.
-            page.flush_cache()
+                page.flush_cache()
 
-            if on_progress and (page_number % progress_every == 0 or page_number == total_pages):
-                on_progress(page_number, total_pages, len(results))
-            if page_number % progress_every == 0 or page_number == total_pages:
-                logger.info(
-                    f"Page {page_number}/{total_pages} traitée "
-                    f"({len(results)} lignes pertinentes trouvées jusque-là)."
-                )
+                if on_progress and (page_number % progress_every == 0 or page_number == total_pages):
+                    on_progress(page_number, total_pages, len(results))
+                if page_number % progress_every == 0 or page_number == total_pages:
+                    logger.info(
+                        f"Page {page_number}/{total_pages} traitée "
+                        f"({len(results)} lignes pertinentes trouvées jusque-là)."
+                    )
+
+        # Le "with" ci-dessus referme le PDF et libère le cache du lot --
+        # gc.collect() force Python à récupérer cette mémoire immédiatement
+        # plutôt que d'attendre le prochain passage du ramasse-miettes.
+        gc.collect()
+        batch_start = batch_end
 
     logger.info(
         f"Analyse terminée : {total_rows_seen} lignes de marché lues au total, "
