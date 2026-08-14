@@ -41,15 +41,25 @@ st.set_page_config(
 )
 
 
+def _get_expected_password():
+    """Cherche APP_PASSWORD dans st.secrets (Streamlit Community Cloud) puis
+    dans les variables d'environnement (.env en local, secret d'une autre
+    plateforme d'hébergement) -- jamais codé en dur dans le fichier."""
+    try:
+        if "APP_PASSWORD" in st.secrets:
+            return st.secrets["APP_PASSWORD"]
+    except Exception:
+        pass  # Pas de secrets.toml configuré -- normal en local/hors Streamlit Cloud.
+    return os.environ.get("APP_PASSWORD")
+
+
 def check_password() -> bool:
     """Porte d'accès par mot de passe partagé -- suffisant pour un outil interne
-    à faible trafic, pas un vrai système multi-compte. Le mot de passe vit dans
-    la variable d'environnement APP_PASSWORD (fichier .env en local, secret de
-    la plateforme d'hébergement en production), jamais dans le code source."""
+    à faible trafic, pas un vrai système multi-compte."""
     if st.session_state.get("authenticated"):
         return True
 
-    expected = os.environ.get("APP_PASSWORD")
+    expected = _get_expected_password()
     if not expected:
         # Pas de mot de passe configuré (ex: dev local sans .env) -- ne pas
         # bloquer silencieusement l'accès à cause d'une variable manquante,
