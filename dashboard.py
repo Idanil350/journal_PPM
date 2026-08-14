@@ -44,10 +44,13 @@ st.set_page_config(
 def _get_expected_password():
     """Cherche APP_PASSWORD dans st.secrets (Streamlit Community Cloud) puis
     dans les variables d'environnement (.env en local, secret d'une autre
-    plateforme d'hébergement) -- jamais codé en dur dans le fichier."""
+    plateforme d'hébergement) -- jamais codé en dur dans le fichier. Utilise
+    .get() plutôt que l'opérateur "in" -- plus sûr face à st.secrets quand
+    aucun secrets.toml n'existe (comportement qui varie selon le contexte)."""
     try:
-        if "APP_PASSWORD" in st.secrets:
-            return st.secrets["APP_PASSWORD"]
+        value = st.secrets.get("APP_PASSWORD")
+        if value:
+            return value
     except Exception:
         pass  # Pas de secrets.toml configuré -- normal en local/hors Streamlit Cloud.
     return os.environ.get("APP_PASSWORD")
