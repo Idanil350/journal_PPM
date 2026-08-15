@@ -339,7 +339,7 @@ def clean_cell(value) -> str:
 # Extraction du PDF
 # ---------------------------------------------------------------------------
 
-def extract_pdf(pdf_path, progress_every: int = 100, on_progress=None, batch_size: int = 150):
+def extract_pdf(pdf_path, progress_every: int = 100, on_progress=None, batch_size: int = 150, on_batch=None):
     """Parcourt le PDF page par page et retourne la liste des lignes de
     marché dont le texte contient au moins un mot-clé cible.
 
@@ -360,7 +360,15 @@ def extract_pdf(pdf_path, progress_every: int = 100, on_progress=None, batch_siz
     `on_progress(page_number, total_pages, rows_found_so_far)`, si fourni,
     est appelé tous les `progress_every` pages (et sur la dernière) -- permet
     à une interface (CLI ou Streamlit) de piloter sa propre barre de
-    progression sans dupliquer la boucle d'extraction."""
+    progression sans dupliquer la boucle d'extraction.
+
+    `on_batch(batch_records, edition_date)`, si fourni, est appelé une fois
+    par lot de `batch_size` pages avec les lignes trouvées dans CE lot --
+    permet à l'appelant (Streamlit) de sauvegarder au fur et à mesure dans
+    la mémoire persistante plutôt qu'attendre la toute fin. Sur un PDF de
+    1770 pages qui peut prendre plusieurs minutes, une connexion mobile
+    perdue en cours de route ne fait alors perdre que le lot en cours, pas
+    tout le travail déjà fait."""
     results = []
     total_rows_seen = 0
     edition_date = None
@@ -372,6 +380,7 @@ def extract_pdf(pdf_path, progress_every: int = 100, on_progress=None, batch_siz
     batch_start = 0
     while batch_start < total_pages:
         batch_end = min(batch_start + batch_size, total_pages)
+        batch_records = []
 
         with pdfplumber.open(pdf_path) as pdf:
             for page_index in range(batch_start, batch_end):
@@ -407,6 +416,7 @@ def extract_pdf(pdf_path, progress_every: int = 100, on_progress=None, batch_siz
                         record["Catégories détectées"] = ", ".join(categories)
                         record["À relire (terme générique)"] = "Oui" if uses_generic_term else ""
                         results.append(record)
+                        batch_records.append(record)
 
                 page.flush_cache()
 
@@ -417,6 +427,9 @@ def extract_pdf(pdf_path, progress_every: int = 100, on_progress=None, batch_siz
                         f"Page {page_number}/{total_pages} traitée "
                         f"({len(results)} lignes pertinentes trouvées jusque-là)."
                     )
+
+        if on_batch and batch_records:
+            on_batch(batch_records, edition_date)
 
         # Le "with" ci-dessus referme le PDF et libère le cache du lot --
         # gc.collect() force Python à récupérer cette mémoire immédiatement

@@ -301,11 +301,28 @@ if uploaded_file is not None:
                 progress.progress(page_number / total, text=f"Page {page_number}/{total} traitée...")
                 status.caption(f"{found_so_far} ligne(s) pertinente(s) trouvée(s) jusque-là.")
 
-            results, edition_date = extract_pdf(tmp_path, progress_every=25, on_progress=on_progress)
+            # Sauvegarde en mémoire lot par lot, PENDANT l'extraction -- pas
+            # seulement à la toute fin. Un fichier de 1770 pages peut prendre
+            # plusieurs minutes ; sur mobile, si la connexion tombe en cours
+            # de route (écran verrouillé, changement d'appli), tout ce qui a
+            # déjà été traité reste en sécurité au lieu d'être perdu.
+            tagged_accumulator = []
+
+            def on_batch(batch_records, batch_edition_date):
+                if collection is not None:
+                    tagged_accumulator.extend(
+                        db.classify_and_store(collection, batch_records, edition_date=batch_edition_date)
+                    )
+                else:
+                    tagged_accumulator.extend(batch_records)
+
+            _raw_results, edition_date = extract_pdf(
+                tmp_path, progress_every=25, on_progress=on_progress, on_batch=on_batch,
+            )
 
             progress.empty()
             status.empty()
-            st.session_state["ppm_results"] = results
+            st.session_state["ppm_results"] = tagged_accumulator
             st.session_state["ppm_total_pages"] = total_pages
             st.session_state["ppm_edition_date"] = edition_date
         finally:
@@ -338,18 +355,17 @@ if hide_past:
         )
         st.stop()
 
-# Comparaison avec les éditions précédentes du PPM déjà chargées -- appliquée
-# APRÈS le filtrage IT/en-cours, jamais sur le contenu lui-même. Sans base
-# configurée, tout est marqué "Nouveau" par défaut (comportement identique à
-# avant l'ajout de cette mémoire).
+# Le statut Nouveau/Modifié/Déjà vu a déjà été calculé et enregistré lot par
+# lot pendant l'extraction (voir on_batch ci-dessus) -- pas besoin de
+# reclassifier ici, ça compterait tout comme "déjà vu" puisque ça vient
+# d'être stocké. On se contente de compter/filtrer sur le Statut déjà présent.
 new_count = updated_count = None
 if collection is not None:
-    results = db.classify_and_store(collection, results, edition_date=edition_date)
-    new_count = sum(1 for r in results if r["Statut"] == db.STATUS_NEW)
-    updated_count = sum(1 for r in results if r["Statut"] == db.STATUS_UPDATED)
+    new_count = sum(1 for r in results if r.get("Statut") == db.STATUS_NEW)
+    updated_count = sum(1 for r in results if r.get("Statut") == db.STATUS_UPDATED)
     if show_new_only:
         before_new_filter = len(results)
-        results = [r for r in results if r["Statut"] in (db.STATUS_NEW, db.STATUS_UPDATED)]
+        results = [r for r in results if r.get("Statut") in (db.STATUS_NEW, db.STATUS_UPDATED)]
         if not results:
             st.info(
                 f"Les {before_new_filter} marché(s) IT retenus sont déjà connus et inchangés "
@@ -389,7 +405,7 @@ with tab_data:
         st.subheader("Résultats")
         df = results_to_dataframe(results)
         if new_count is not None:
-            df.insert(0, "Statut", [r["Statut"] for r in results])
+            df.insert(0, "Statut", [r.get("Statut") for r in results])
         st.dataframe(
             df,
             hide_index=True,
