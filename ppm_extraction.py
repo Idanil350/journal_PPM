@@ -28,6 +28,7 @@ import gc
 import logging
 import re
 import sys
+import unicodedata
 from datetime import date, datetime
 from io import BytesIO
 from pathlib import Path
@@ -248,6 +249,41 @@ def clean_authority_name(header: str) -> str:
     return re.sub(r"\s*-\s*\d{6,}\s*$", "", header).strip() or header
 
 
+_MONTHS_FR = {
+    "janvier": 1, "fevrier": 2, "mars": 3, "avril": 4, "mai": 5, "juin": 6,
+    "juillet": 7, "aout": 8, "septembre": 9, "octobre": 10, "novembre": 11, "decembre": 12,
+}
+
+_EDITION_DATE_RE = re.compile(r"mise\s*a\s*jour\s*du\s+(\d{1,2})\s+([^\d,]+?)\s+(\d{4})")
+
+
+def _fold_ascii(text: str) -> str:
+    return unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii").lower()
+
+
+def extract_edition_date(first_page_text: str):
+    """Date de "MISE A JOUR DU [date]" imprimée en tête de la 1ère page du
+    PPM -- la vraie date de publication de cette édition par l'ARMP,
+    indépendante du jour où quelqu'un a pensé à uploader le fichier dans
+    l'app. Utilisée comme référence pour "nouveau depuis telle date" au lieu
+    de l'heure d'upload -- sinon un retard d'upload ferait passer un projet
+    publié le 10 pour "nouveau depuis le 20". None si introuvable (texte
+    fourni n'est pas celui de la 1ère page, ou format inattendu)."""
+    if not first_page_text:
+        return None
+    match = _EDITION_DATE_RE.search(_fold_ascii(first_page_text))
+    if not match:
+        return None
+    day, month_word, year = match.groups()
+    month = _MONTHS_FR.get(month_word.strip())
+    if month is None:
+        return None
+    try:
+        return date(int(year), month, int(day))
+    except ValueError:
+        return None
+
+
 def parse_amount(value: str):
     """"40 000 000" -> 40000000. None si aucun chiffre exploitable."""
     if not value:
@@ -316,12 +352,18 @@ def extract_pdf(pdf_path, progress_every: int = 100, on_progress=None, batch_siz
     au-delà de la limite gratuite (~1 Go) de Streamlit Community Cloud --
     l'app plantait (tuée par manque de mémoire) sans erreur Python visible.
 
+    Retourne `(results, edition_date)` -- `edition_date` est la date "MISE A
+    JOUR DU ..." imprimée en tête de la 1ère page (None si introuvable),
+    utilisée en aval comme référence pour "nouveau depuis telle date" au
+    lieu de l'heure d'upload.
+
     `on_progress(page_number, total_pages, rows_found_so_far)`, si fourni,
     est appelé tous les `progress_every` pages (et sur la dernière) -- permet
     à une interface (CLI ou Streamlit) de piloter sa propre barre de
     progression sans dupliquer la boucle d'extraction."""
     results = []
     total_rows_seen = 0
+    edition_date = None
 
     with pdfplumber.open(pdf_path) as pdf:
         total_pages = len(pdf.pages)
@@ -337,6 +379,8 @@ def extract_pdf(pdf_path, progress_every: int = 100, on_progress=None, batch_siz
                 page_number = page_index + 1
                 page_text = page.extract_text() or ""
                 buyer_header = extract_buyer_header(page_text)
+                if page_number == 1:
+                    edition_date = extract_edition_date(page_text)
 
                 for table in page.extract_tables():
                     if not table or len(table) < 2:
@@ -384,7 +428,14 @@ def extract_pdf(pdf_path, progress_every: int = 100, on_progress=None, batch_siz
         f"Analyse terminée : {total_rows_seen} lignes de marché lues au total, "
         f"{len(results)} retenues (mention d'un mot-clé IT/Numérique/COLEPS)."
     )
-    return results
+    if edition_date:
+        logger.info(f"Date de l'édition du PPM détectée : {edition_date.strftime('%d/%m/%Y')}.")
+    else:
+        logger.warning(
+            "Date de l'édition du PPM introuvable en tête de la 1ère page -- "
+            "la date d'upload sera utilisée comme repli pour le suivi des nouveautés."
+        )
+    return results, edition_date
 
 
 # ---------------------------------------------------------------------------
@@ -551,7 +602,10 @@ def main():
         logger.error(f"Fichier introuvable : {args.pdf_path}")
         sys.exit(1)
 
-    results = extract_pdf_with_ocr(args.pdf_path) if args.ocr else extract_pdf(args.pdf_path, progress_every=args.progress_every)
+    if args.ocr:
+        results = extract_pdf_with_ocr(args.pdf_path)
+    else:
+        results, _edition_date = extract_pdf(args.pdf_path, progress_every=args.progress_every)
     if args.ongoing_only:
         before = len(results)
         results = filter_ongoing(results)

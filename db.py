@@ -55,12 +55,18 @@ def _snapshot(record: dict) -> dict:
     return {field: record.get(field) for field in _SNAPSHOT_FIELDS}
 
 
-def classify_and_store(collection, results: list[dict]) -> list[dict]:
+def classify_and_store(collection, results: list[dict], edition_date=None) -> list[dict]:
     """Pour chaque ligne extraite, détermine si le marché est Nouveau,
     Modifié (budget/dates changés depuis la dernière édition vue) ou Déjà vu,
     puis met à jour la base en conséquence. `collection` a l'interface
-    pymongo standard (find_one/update_one) -- injectable pour les tests."""
-    now = datetime.now(timezone.utc).isoformat()
+    pymongo standard (find_one/update_one) -- injectable pour les tests.
+
+    `edition_date` est la date "MISE A JOUR DU ..." imprimée sur le PPM
+    (extraite par ppm_extraction.extract_edition_date) -- utilisée comme
+    référence pour first_seen/last_seen à la place de l'heure d'upload, pour
+    qu'un retard à uploader ne fasse pas passer un projet publié le 10 pour
+    "nouveau depuis le 20". Repli sur l'heure actuelle si introuvable."""
+    reference = edition_date.isoformat() if edition_date else datetime.now(timezone.utc).isoformat()
     tagged = []
     for record in results:
         key = market_key(record)
@@ -77,8 +83,8 @@ def classify_and_store(collection, results: list[dict]) -> list[dict]:
         collection.update_one(
             {"_id": key},
             {
-                "$set": {"snapshot": snapshot, "record": record, "last_seen": now},
-                "$setOnInsert": {"first_seen": now},
+                "$set": {"snapshot": snapshot, "record": record, "last_seen": reference},
+                "$setOnInsert": {"first_seen": reference},
             },
             upsert=True,
         )

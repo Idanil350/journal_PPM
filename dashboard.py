@@ -199,12 +199,13 @@ if uploaded_file is not None:
                 progress.progress(page_number / total, text=f"Page {page_number}/{total} traitée...")
                 status.caption(f"{found_so_far} ligne(s) pertinente(s) trouvée(s) jusque-là.")
 
-            results = extract_pdf(tmp_path, progress_every=25, on_progress=on_progress)
+            results, edition_date = extract_pdf(tmp_path, progress_every=25, on_progress=on_progress)
 
             progress.empty()
             status.empty()
             st.session_state["ppm_results"] = results
             st.session_state["ppm_total_pages"] = total_pages
+            st.session_state["ppm_edition_date"] = edition_date
         finally:
             tmp_path.unlink(missing_ok=True)
 
@@ -216,6 +217,7 @@ if "ppm_results" not in st.session_state:
 
 results = st.session_state["ppm_results"]
 total_pages = st.session_state["ppm_total_pages"]
+edition_date = st.session_state.get("ppm_edition_date")
 
 if not results:
     st.warning(f"{total_pages} pages analysées -- aucune ligne ne correspond aux mots-clés IT/COLEPS.")
@@ -240,7 +242,7 @@ if hide_past:
 # avant l'ajout de cette mémoire).
 new_count = updated_count = None
 if collection is not None:
-    results = db.classify_and_store(collection, results)
+    results = db.classify_and_store(collection, results, edition_date=edition_date)
     new_count = sum(1 for r in results if r["Statut"] == db.STATUS_NEW)
     updated_count = sum(1 for r in results if r["Statut"] == db.STATUS_UPDATED)
     if show_new_only:
@@ -265,6 +267,17 @@ with st.container(horizontal=True):
     st.metric("Budget total identifié", fmt_fcfa(kpis["budget_total"]), border=True)
     if new_count is not None:
         st.metric("Nouveaux depuis la dernière édition", new_count, border=True)
+
+if edition_date:
+    st.caption(
+        f":material/event: Édition du PPM détectée : {edition_date.strftime('%d/%m/%Y')} -- "
+        "c'est cette date qui sert de référence pour le suivi des nouveautés, pas la date d'upload."
+    )
+elif collection is not None:
+    st.caption(
+        ":material/warning: Date de l'édition introuvable dans ce PDF -- la date d'upload est "
+        "utilisée en repli pour le suivi des nouveautés (moins fiable si l'upload est tardif)."
+    )
 
 if hide_past and hidden_count:
     st.caption(f":material/schedule: {hidden_count} marché(s) déjà attribué(s) masqué(s).")
