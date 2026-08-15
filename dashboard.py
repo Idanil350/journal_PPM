@@ -4,7 +4,7 @@ DAREDAB (répertoire des autorités, budget, sources de financement)."""
 
 import os
 import tempfile
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pdfplumber
@@ -132,19 +132,76 @@ with st.sidebar:
 # directement la mémoire MongoDB, sans dépendre d'une extraction lancée dans
 # la session en cours. tab_data/tab_bi, eux, ont besoin des résultats d'une
 # extraction et sont remplis plus bas dans le script.
-tab_data, tab_bi, tab_history = st.tabs([
-    ":material/table_chart: Lignes extraites",
-    ":material/insights: Business intelligence",
-    ":material/history: Historique",
-])
+#
+# on_change="rerun" active .open : sans ça, TOUS les onglets s'exécutent à
+# CHAQUE interaction n'importe où dans l'app (upload, filtre...), donc
+# mark_consultation() avancerait le repère "dernière consultation" à chaque
+# clic ailleurs -- pas seulement quand quelqu'un regarde vraiment cet onglet.
+tab_data, tab_bi, tab_history = st.tabs(
+    [
+        ":material/table_chart: Lignes extraites",
+        ":material/insights: Business intelligence",
+        ":material/history: Historique",
+    ],
+    on_change="rerun",
+    key="ppm_active_tab",
+)
 
-with tab_history:
+def render_history_tab():
+    """Corps de l'onglet Historique, appelé seulement quand il est réellement
+    affiché (voir garde `if tab_history.open` plus bas) -- sans ça,
+    mark_consultation() avancerait le repère "dernière consultation" à
+    chaque interaction ailleurs dans l'app, pas seulement quand quelqu'un
+    regarde vraiment cet onglet."""
     if collection is None:
         st.info(
             "Mémoire entre éditions désactivée -- configure MONGO_URI pour activer cet historique.",
             icon=":material/info:",
         )
     else:
+        with st.container(border=True):
+            st.subheader("Nouveautés depuis la dernière consultation")
+            st.caption(
+                "Ce que le DG a demandé explicitement : les projets ajoutés ou modifiés "
+                "depuis la dernière fois que quelqu'un chez DAREDAB a consulté cette page -- "
+                "automatique, rien à taper. Un repère partagé pour toute l'équipe."
+            )
+            meta_collection = db.get_meta_collection()
+            last_consultation = db.get_last_consultation(meta_collection)
+            changes = db.get_changes_since(collection, last_consultation or "0000-00-00")
+
+            if last_consultation:
+                last_dt = datetime.fromisoformat(last_consultation)
+                st.caption(f"Dernière consultation : {last_dt.strftime('%d/%m/%Y à %H:%M')} (heure UTC).")
+            else:
+                st.caption("Première consultation -- tout ce qui est en mémoire est affiché.")
+
+            st.metric("Nouveautés depuis la dernière consultation", len(changes), border=True)
+            if changes:
+                changes_df = results_to_dataframe(changes)
+                st.dataframe(
+                    changes_df,
+                    hide_index=True,
+                    column_config={
+                        "Désignation et localisation du projet": st.column_config.TextColumn(pinned=True),
+                        "Montant prévisionnel (FCFA)": st.column_config.NumberColumn(format="%d"),
+                    },
+                )
+                st.download_button(
+                    "Télécharger en Excel",
+                    data=to_excel_bytes(changes_df),
+                    file_name="nouveautes_depuis_derniere_consultation.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    icon=":material/download:",
+                    key="dl_changes",
+                )
+            else:
+                st.info("Rien de nouveau depuis la dernière consultation.", icon=":material/task_alt:")
+
+            # Marquer la consultation APRÈS avoir lu/affiché -- jamais avant,
+            # sinon on écrase le repère avant de s'en être servi.
+            db.mark_consultation(meta_collection)
+
         with st.container(border=True):
             st.subheader("Projets dont le lancement de consultation démarre depuis une date")
             st.caption(
@@ -217,6 +274,11 @@ with tab_history:
                 )
             else:
                 st.info("Aucun nouveau marché détecté depuis cette date.", icon=":material/task_alt:")
+
+
+with tab_history:
+    if tab_history.open:
+        render_history_tab()
 
 uploaded_file = st.file_uploader("Journal de programmation des marchés (PDF)", type=["pdf"])
 

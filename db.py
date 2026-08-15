@@ -67,8 +67,19 @@ def classify_and_store(collection, results: list[dict], edition_date=None) -> li
     (extraite par ppm_extraction.extract_edition_date) -- utilisée comme
     référence pour first_seen/last_seen à la place de l'heure d'upload, pour
     qu'un retard à uploader ne fasse pas passer un projet publié le 10 pour
-    "nouveau depuis le 20". Repli sur l'heure actuelle si introuvable."""
+    "nouveau depuis le 20". Repli sur l'heure actuelle si introuvable.
+
+    `last_changed` n'est mis à jour QUE quand le marché est Nouveau ou
+    Modifié -- pas quand il est simplement retrouvé inchangé -- pour que
+    get_changes_since() puisse répondre à "qu'est-ce qui a vraiment changé",
+    sans les marchés "déjà vus" qui n'apportent aucune information neuve.
+    Il utilise l'heure réelle (pas `edition_date`) : c'est ce qui doit rester
+    sur la même horloge que mark_consultation()/get_last_consultation() --
+    sinon un PPM daté dans le passé (uploadé en retard) ne dépasserait
+    jamais un repère de consultation basé sur l'heure actuelle, et les
+    changements resteraient invisibles pour toujours."""
     reference = edition_date.isoformat() if edition_date else datetime.now(timezone.utc).isoformat()
+    processed_at = datetime.now(timezone.utc).isoformat()
     tagged = []
     for record in results:
         key = market_key(record)
@@ -82,12 +93,13 @@ def classify_and_store(collection, results: list[dict], edition_date=None) -> li
         else:
             status = STATUS_SEEN
 
+        set_fields = {"snapshot": snapshot, "record": record, "last_seen": reference}
+        if status in (STATUS_NEW, STATUS_UPDATED):
+            set_fields["last_changed"] = processed_at
+
         collection.update_one(
             {"_id": key},
-            {
-                "$set": {"snapshot": snapshot, "record": record, "last_seen": reference},
-                "$setOnInsert": {"first_seen": reference},
-            },
+            {"$set": set_fields, "$setOnInsert": {"first_seen": reference}},
             upsert=True,
         )
         tagged.append({**record, "Statut": status})
@@ -112,6 +124,54 @@ def get_markets_since(collection, since_date) -> list[dict]:
     return results
 
 
+def get_changes_since(collection, since_key) -> list[dict]:
+    """Marchés ajoutés OU modifiés strictement après `since_key` (chaîne ISO
+    comparable à `last_changed`) -- exclut les marchés simplement "déjà vus"
+    inchangés. C'est la définition exacte donnée par le DG : "les nouvelles
+    informations, c'est ce qui a changé depuis la dernière consultation".
+
+    Borne strictement supérieure (pas >=) : `since_key` vient typiquement de
+    mark_consultation(), pris juste après avoir lu ce résultat -- une
+    comparaison inclusive re-signalerait comme "changé" un marché dont
+    l'horodatage tombe exactement sur ce repère."""
+    if collection is None:
+        return []
+    docs = collection.find({"last_changed": {"$gt": since_key}}).sort("last_changed", -1)
+    results = []
+    for doc in docs:
+        record = dict(doc.get("record") or {})
+        record["_last_changed"] = doc.get("last_changed")
+        results.append(record)
+    return results
+
+
+_CONSULTATION_ID = "last_consultation"
+
+
+def get_last_consultation(meta_collection):
+    """Horodatage (chaîne ISO) de la dernière fois que quelqu'un a consulté
+    les nouveautés -- un seul repère partagé pour toute l'équipe DAREDAB
+    (le DG a précisé que ce n'est pas personnalisé par employé). None si
+    jamais consulté."""
+    if meta_collection is None:
+        return None
+    doc = meta_collection.find_one({"_id": _CONSULTATION_ID})
+    return doc.get("timestamp") if doc else None
+
+
+def mark_consultation(meta_collection) -> None:
+    """Enregistre "maintenant" comme nouvelle dernière consultation. À
+    appeler APRÈS avoir lu/affiché les changements depuis l'ancien repère --
+    jamais avant, sinon on écrase la référence avant de s'en être servi."""
+    if meta_collection is None:
+        return
+    meta_collection.update_one(
+        {"_id": _CONSULTATION_ID},
+        {"$set": {"timestamp": datetime.now(timezone.utc).isoformat()}},
+        upsert=True,
+    )
+
+
 def get_markets_by_launch_date(collection, since_date, date_column: str = LAUNCH_COLUMN) -> list[dict]:
     """Tous les marchés (dans toute la mémoire enregistrée) dont la colonne
     "Lancement de consultation / Invitation à soumissionner" est prévue à
@@ -134,7 +194,7 @@ def get_markets_by_launch_date(collection, since_date, date_column: str = LAUNCH
 
 
 @st.cache_resource(show_spinner=False)
-def get_collection():
+def _get_client():
     """Connexion Mongo paresseuse et mise en cache pour la durée de vie du
     serveur (évite de reconnecter/ping à chaque rerun Streamlit) -- None si
     MONGO_URI n'est pas configuré (l'app doit continuer à fonctionner sans
@@ -152,4 +212,18 @@ def get_collection():
         client.admin.command("ping")
     except PyMongoError:
         return None
-    return client["daredab_ppm"]["markets"]
+    return client
+
+
+def get_collection():
+    """Collection des marchés suivis."""
+    client = _get_client()
+    return client["daredab_ppm"]["markets"] if client is not None else None
+
+
+def get_meta_collection():
+    """Collection séparée pour des repères globaux (ex: dernière
+    consultation) -- distincte de `markets` pour ne pas polluer les requêtes
+    qui parcourent tous les marchés (get_markets_by_launch_date etc.)."""
+    client = _get_client()
+    return client["daredab_ppm"]["meta"] if client is not None else None
