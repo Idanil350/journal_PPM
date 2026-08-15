@@ -18,7 +18,9 @@ import streamlit as st
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
 
-from ppm_extraction import ATTRIBUTION_COLUMN, clean_authority_name
+from ppm_extraction import ATTRIBUTION_COLUMN, clean_authority_name, parse_ppm_date
+
+LAUNCH_COLUMN = "Lancement de consultation / Invitation à soumissionner"
 
 STATUS_NEW = "Nouveau"
 STATUS_UPDATED = "Modifié"
@@ -107,6 +109,27 @@ def get_markets_since(collection, since_date) -> list[dict]:
         record = dict(doc.get("record") or {})
         record["_first_seen"] = doc.get("first_seen")
         results.append(record)
+    return results
+
+
+def get_markets_by_launch_date(collection, since_date, date_column: str = LAUNCH_COLUMN) -> list[dict]:
+    """Tous les marchés (dans toute la mémoire enregistrée) dont la colonne
+    "Lancement de consultation / Invitation à soumissionner" est prévue à
+    partir de `since_date` -- critère demandé explicitement par le DG :
+    "nouveau depuis une date" au sens où le lancement de la consultation
+    a commencé à partir de cette date, pas au sens de notre propre suivi
+    Nouveau/Modifié/Déjà vu (qui reste disponible séparément, sans lien
+    avec cette fonction). Ne dépend pas d'une extraction en session --
+    relit tout ce qui est déjà en mémoire."""
+    if collection is None:
+        return []
+    results = []
+    for doc in collection.find({}):
+        record = dict(doc.get("record") or {})
+        launch = parse_ppm_date(record.get(date_column))
+        if launch is not None and launch >= since_date:
+            results.append(record)
+    results.sort(key=lambda r: parse_ppm_date(r.get(date_column)) or since_date)
     return results
 
 

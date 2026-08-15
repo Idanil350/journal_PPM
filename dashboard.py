@@ -139,44 +139,84 @@ tab_data, tab_bi, tab_history = st.tabs([
 ])
 
 with tab_history:
-    st.subheader("Nouveaux marchés depuis une date")
-    st.caption(
-        "Répond directement à « quels sont les nouveaux projets depuis le [date] ? » -- "
-        "lit la mémoire déjà enregistrée, pas besoin d'avoir chargé un journal dans cette session."
-    )
     if collection is None:
         st.info(
             "Mémoire entre éditions désactivée -- configure MONGO_URI pour activer cet historique.",
             icon=":material/info:",
         )
     else:
-        since = st.date_input(
-            "Depuis quelle date", value=date.today() - timedelta(days=14), format="DD/MM/YYYY",
-        )
-        history_results = db.get_markets_since(collection, since)
-        st.metric(
-            f"Nouveaux marchés depuis le {since.strftime('%d/%m/%Y')}",
-            len(history_results), border=True,
-        )
-        if history_results:
-            history_df = results_to_dataframe(history_results)
-            st.dataframe(
-                history_df,
-                hide_index=True,
-                column_config={
-                    "Désignation et localisation du projet": st.column_config.TextColumn(pinned=True),
-                    "Montant prévisionnel (FCFA)": st.column_config.NumberColumn(format="%d"),
-                },
+        with st.container(border=True):
+            st.subheader("Projets dont le lancement de consultation démarre depuis une date")
+            st.caption(
+                "Répond directement à « quels sont les nouveaux projets depuis le [date] ? » au "
+                "sens du DG : filtre sur la colonne « Lancement de consultation / Invitation à "
+                "soumissionner » -- pas besoin d'avoir chargé un journal dans cette session."
             )
-            st.download_button(
-                "Télécharger en Excel",
-                data=to_excel_bytes(history_df),
-                file_name=f"nouveaux_marches_depuis_{since.isoformat()}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                icon=":material/download:",
+            since_launch = st.date_input(
+                "Lancement de consultation depuis quelle date", key="since_launch",
+                value=date.today() - timedelta(days=14), format="DD/MM/YYYY",
             )
-        else:
-            st.info("Aucun nouveau marché détecté depuis cette date.", icon=":material/task_alt:")
+            launch_results = db.get_markets_by_launch_date(collection, since_launch)
+            st.metric(
+                f"Projets dont le lancement démarre depuis le {since_launch.strftime('%d/%m/%Y')}",
+                len(launch_results), border=True,
+            )
+            if launch_results:
+                launch_df = results_to_dataframe(launch_results)
+                st.dataframe(
+                    launch_df,
+                    hide_index=True,
+                    column_config={
+                        "Désignation et localisation du projet": st.column_config.TextColumn(pinned=True),
+                        "Montant prévisionnel (FCFA)": st.column_config.NumberColumn(format="%d"),
+                    },
+                )
+                st.download_button(
+                    "Télécharger en Excel",
+                    data=to_excel_bytes(launch_df),
+                    file_name=f"lancement_consultation_depuis_{since_launch.isoformat()}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    icon=":material/download:",
+                    key="dl_launch",
+                )
+            else:
+                st.info("Aucun projet avec un lancement de consultation prévu depuis cette date.", icon=":material/task_alt:")
+
+        with st.container(border=True):
+            st.subheader("Marchés jamais vus par DAREDAB depuis une date")
+            st.caption(
+                "Autre question, différente de celle ci-dessus : quels marchés IT DAREDAB n'avait "
+                "encore jamais détectés dans aucune édition précédente du PPM."
+            )
+            since_seen = st.date_input(
+                "Jamais vu depuis quelle date", key="since_seen",
+                value=date.today() - timedelta(days=14), format="DD/MM/YYYY",
+            )
+            seen_results = db.get_markets_since(collection, since_seen)
+            st.metric(
+                f"Marchés jamais vus, détectés depuis le {since_seen.strftime('%d/%m/%Y')}",
+                len(seen_results), border=True,
+            )
+            if seen_results:
+                seen_df = results_to_dataframe(seen_results)
+                st.dataframe(
+                    seen_df,
+                    hide_index=True,
+                    column_config={
+                        "Désignation et localisation du projet": st.column_config.TextColumn(pinned=True),
+                        "Montant prévisionnel (FCFA)": st.column_config.NumberColumn(format="%d"),
+                    },
+                )
+                st.download_button(
+                    "Télécharger en Excel",
+                    data=to_excel_bytes(seen_df),
+                    file_name=f"nouveaux_marches_depuis_{since_seen.isoformat()}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    icon=":material/download:",
+                    key="dl_seen",
+                )
+            else:
+                st.info("Aucun nouveau marché détecté depuis cette date.", icon=":material/task_alt:")
 
 uploaded_file = st.file_uploader("Journal de programmation des marchés (PDF)", type=["pdf"])
 
