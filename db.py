@@ -86,6 +86,24 @@ def classify_and_store(collection, results: list[dict]) -> list[dict]:
     return tagged
 
 
+def get_markets_since(collection, since_date) -> list[dict]:
+    """Tous les marchés détectés comme nouveaux depuis `since_date` (basé sur
+    first_seen) -- lit directement la mémoire persistante, sans dépendre
+    d'une extraction lancée dans la session en cours. Répond directement à
+    "quels sont les nouveaux marchés depuis le [date] ?" sans avoir à
+    ré-uploader/ré-analyser un journal."""
+    if collection is None:
+        return []
+    since_key = since_date.isoformat()
+    docs = collection.find({"first_seen": {"$gte": since_key}}).sort("first_seen", -1)
+    results = []
+    for doc in docs:
+        record = dict(doc.get("record") or {})
+        record["_first_seen"] = doc.get("first_seen")
+        results.append(record)
+    return results
+
+
 @st.cache_resource(show_spinner=False)
 def get_collection():
     """Connexion Mongo paresseuse et mise en cache pour la durée de vie du

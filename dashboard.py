@@ -4,6 +4,7 @@ DAREDAB (répertoire des autorités, budget, sources de financement)."""
 
 import os
 import tempfile
+from datetime import date, timedelta
 from pathlib import Path
 
 import pdfplumber
@@ -126,6 +127,57 @@ with st.sidebar:
         )
     st.caption("DAREDAB · outil d'extraction PPM")
 
+# tab_history est déclaré ici (avant le upload) et rendu tout de suite --
+# il répond à "quels sont les nouveaux marchés depuis telle date ?" en lisant
+# directement la mémoire MongoDB, sans dépendre d'une extraction lancée dans
+# la session en cours. tab_data/tab_bi, eux, ont besoin des résultats d'une
+# extraction et sont remplis plus bas dans le script.
+tab_data, tab_bi, tab_history = st.tabs([
+    ":material/table_chart: Lignes extraites",
+    ":material/insights: Business intelligence",
+    ":material/history: Historique",
+])
+
+with tab_history:
+    st.subheader("Nouveaux marchés depuis une date")
+    st.caption(
+        "Répond directement à « quels sont les nouveaux projets depuis le [date] ? » -- "
+        "lit la mémoire déjà enregistrée, pas besoin d'avoir chargé un journal dans cette session."
+    )
+    if collection is None:
+        st.info(
+            "Mémoire entre éditions désactivée -- configure MONGO_URI pour activer cet historique.",
+            icon=":material/info:",
+        )
+    else:
+        since = st.date_input(
+            "Depuis quelle date", value=date.today() - timedelta(days=14), format="DD/MM/YYYY",
+        )
+        history_results = db.get_markets_since(collection, since)
+        st.metric(
+            f"Nouveaux marchés depuis le {since.strftime('%d/%m/%Y')}",
+            len(history_results), border=True,
+        )
+        if history_results:
+            history_df = results_to_dataframe(history_results)
+            st.dataframe(
+                history_df,
+                hide_index=True,
+                column_config={
+                    "Désignation et localisation du projet": st.column_config.TextColumn(pinned=True),
+                    "Montant prévisionnel (FCFA)": st.column_config.NumberColumn(format="%d"),
+                },
+            )
+            st.download_button(
+                "Télécharger en Excel",
+                data=to_excel_bytes(history_df),
+                file_name=f"nouveaux_marches_depuis_{since.isoformat()}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                icon=":material/download:",
+            )
+        else:
+            st.info("Aucun nouveau marché détecté depuis cette date.", icon=":material/task_alt:")
+
 uploaded_file = st.file_uploader("Journal de programmation des marchés (PDF)", type=["pdf"])
 
 if uploaded_file is not None:
@@ -216,11 +268,6 @@ with st.container(horizontal=True):
 
 if hide_past and hidden_count:
     st.caption(f":material/schedule: {hidden_count} marché(s) déjà attribué(s) masqué(s).")
-
-tab_data, tab_bi = st.tabs([
-    ":material/table_chart: Lignes extraites",
-    ":material/insights: Business intelligence",
-])
 
 with tab_data:
     with st.container(border=True):
