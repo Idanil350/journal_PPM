@@ -7,6 +7,8 @@ import tempfile
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
+import altair as alt
+import pandas as pd
 import pdfplumber
 import streamlit as st
 from dotenv import load_dotenv
@@ -34,6 +36,33 @@ def fmt_fcfa(amount) -> str:
     if amount >= 1_000_000:
         return f"{amount / 1_000_000:.1f} M FCFA".replace(".", ",")
     return f"{amount:,}".replace(",", " ") + " FCFA"
+
+
+def priority_bar_chart(df: pd.DataFrame, category_col: str, count_col: str, budget_col: str):
+    """Graphique Altair : barres triées par volume, couleur selon le budget
+    total (deuxième dimension visible d'un coup d'œil), infobulle complète
+    au survol -- remplace les st.bar_chart plats qui ne montraient que le
+    nombre de lignes, sans le poids financier de chaque catégorie."""
+    chart = (
+        alt.Chart(df)
+        .mark_bar()
+        .encode(
+            x=alt.X(f"{count_col}:Q", title="Nombre de marchés"),
+            y=alt.Y(f"{category_col}:N", sort="-x", title=None),
+            color=alt.Color(
+                f"{budget_col}:Q", title="Budget total (FCFA)",
+                scale=alt.Scale(scheme="blues"),
+                legend=alt.Legend(format=","),
+            ),
+            tooltip=[
+                alt.Tooltip(f"{category_col}:N", title="Catégorie"),
+                alt.Tooltip(f"{count_col}:Q", title="Marchés"),
+                alt.Tooltip(f"{budget_col}:Q", title="Budget total (FCFA)", format=","),
+            ],
+        )
+        .properties(height=alt.Step(28))
+    )
+    st.altair_chart(chart)
 
 
 st.set_page_config(
@@ -146,6 +175,69 @@ tab_data, tab_bi, tab_history = st.tabs(
     on_change="rerun",
     key="ppm_active_tab",
 )
+
+def render_priority_panel():
+    """Panneau de décision principal de l'onglet Business Intelligence :
+    marchés encore ouverts classés par potentiel commercial, avec une
+    action NOMMÉE (pas un score seul à interpréter) et un bouton pour
+    enregistrer la décision de DAREDAB. DAREDAB est encore jeune sur ce
+    secteur (~5 ans) -- ce panneau sert à observer où se positionner, pas à
+    prédire un résultat garanti. Appelé seulement quand l'onglet BI est
+    réellement affiché (voir garde `if tab_bi.open` plus bas)."""
+    st.subheader(":material/lightbulb: Priorités commerciales")
+    st.caption(
+        "Marchés encore ouverts, classés par potentiel pour DAREDAB (financement, "
+        "catégorie IT, urgence du lancement, acheteur récurrent). Choisis une décision "
+        "pour garder une trace -- ça sert aussi à construire l'historique de résultats."
+    )
+    if collection is None:
+        st.info(
+            "Mémoire désactivée -- configure MONGO_URI pour activer ce panneau.",
+            icon=":material/info:",
+        )
+        return
+
+    opportunities = db.get_priority_opportunities(collection, limit=10)
+    if not opportunities:
+        st.info("Aucune opportunité à prioriser pour l'instant.", icon=":material/task_alt:")
+        return
+
+    decision_labels = {
+        "go": "✅ Décidé : on y va",
+        "no-go": "❌ Décidé : on laisse tomber",
+    }
+    rows = [{
+        "Marché": opp.get("Désignation et localisation du projet", ""),
+        "Autorité": opp.get("Autorité (en-tête de page)", ""),
+        "Action recommandée": opp["_action"],
+        "Urgent": "Oui" if opp["_urgent"] else "",
+        "Acheteur récurrent": "Oui" if opp["_recurrent"] else "",
+        "Décision": decision_labels.get(opp.get("_decision"), "-- à décider --"),
+        "Choisir": [":material/thumb_up: On y va", ":material/thumb_down: On laisse tomber"],
+        "_market_key": opp.get("_market_key"),
+    } for opp in opportunities]
+    priority_df = pd.DataFrame(rows)
+
+    def handle_priority_decision():
+        click = st.session_state.get("priority_decision")
+        if not click:
+            return
+        row_key = priority_df.iloc[click["row"]]["_market_key"]
+        decision = "go" if "on y va" in click["label"].lower() else "no-go"
+        db.set_decision(collection, row_key, decision)
+        st.toast(f"Décision enregistrée : {click['label']}", icon=":material/check:")
+
+    st.dataframe(
+        priority_df.drop(columns=["_market_key"]),
+        hide_index=True,
+        column_config={
+            "Marché": st.column_config.TextColumn(pinned=True),
+            "Choisir": st.column_config.ButtonColumn(
+                "Décision", on_click=handle_priority_decision, key="priority_decision",
+            ),
+        },
+    )
+
 
 def render_history_tab():
     """Corps de l'onglet Historique, appelé seulement quand il est réellement
@@ -275,6 +367,10 @@ def render_history_tab():
             else:
                 st.info("Aucun nouveau marché détecté depuis cette date.", icon=":material/task_alt:")
 
+
+with tab_bi:
+    if tab_bi.open:
+        render_priority_panel()
 
 with tab_history:
     if tab_history.open:
@@ -448,6 +544,9 @@ with tab_bi:
                 "Budget total (FCFA)": st.column_config.NumberColumn(format="%d"),
             },
         )
+        if not authority_df.empty:
+            top_authorities = authority_df.nlargest(10, "Budget total (FCFA)")
+            priority_bar_chart(top_authorities, "Autorité", "Lignes", "Budget total (FCFA)")
 
     col_a, col_b = st.columns(2)
     with col_a.container(border=True, height="stretch"):
@@ -456,17 +555,13 @@ with tab_bi:
         buyer_type_df = analytics.buyer_type_breakdown()
         st.dataframe(buyer_type_df, hide_index=True)
         if not buyer_type_df.empty:
-            st.bar_chart(
-                buyer_type_df, x="Type d'acheteur", y="Lignes", horizontal=True, x_label="Lignes",
-            )
+            priority_bar_chart(buyer_type_df, "Type d'acheteur", "Lignes", "Budget total (FCFA)")
     with col_b.container(border=True, height="stretch"):
         st.subheader("Source de financement")
         funding_df = analytics.funding_breakdown()
         st.dataframe(funding_df, hide_index=True)
         if not funding_df.empty:
-            st.bar_chart(
-                funding_df, x="Source de financement", y="Lignes", horizontal=True, x_label="Lignes",
-            )
+            priority_bar_chart(funding_df, "Source de financement", "Lignes", "Budget total (FCFA)")
 
     with st.container(border=True):
         st.subheader("Segmentation par catégorie IT")
@@ -485,4 +580,4 @@ with tab_bi:
             },
         )
         if not category_df.empty:
-            st.bar_chart(category_df, x="Catégorie", y="Lignes", horizontal=True, x_label="Lignes")
+            priority_bar_chart(category_df, "Catégorie", "Lignes", "Budget total (FCFA)")

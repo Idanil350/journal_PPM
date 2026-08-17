@@ -12,13 +12,14 @@ import hashlib
 import os
 import re
 import unicodedata
-from datetime import datetime, timezone
+from collections import Counter
+from datetime import date, datetime, timezone
 
 import streamlit as st
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
 
-from ppm_extraction import ATTRIBUTION_COLUMN, clean_authority_name, parse_ppm_date
+from ppm_extraction import ATTRIBUTION_COLUMN, clean_authority_name, filter_ongoing, parse_ppm_date
 
 LAUNCH_COLUMN = "Lancement de consultation / Invitation à soumissionner"
 
@@ -191,6 +192,139 @@ def get_markets_by_launch_date(collection, since_date, date_column: str = LAUNCH
             results.append(record)
     results.sort(key=lambda r: parse_ppm_date(r.get(date_column)) or since_date)
     return results
+
+
+# ---------------------------------------------------------------------------
+# Score d'attractivité commerciale -- pas du machine learning : une
+# heuristique explicable, fondée sur des écarts mesurés en direct sur les
+# vraies données DAREDAB (ticket moyen bailleur ~330M FCFA vs BIP ~57M ;
+# développement logiciel ~203M/dossier vs infrastructure ~78M). DAREDAB est
+# encore jeune sur ce secteur (~5 ans) -- ce score sert à observer où se
+# positionner, pas à prétendre prédire un résultat.
+# ---------------------------------------------------------------------------
+
+FUNDING_TIER = {
+    "BMI-IDA": 3, "BAD": 3, "FM": 3, "BID": 3, "AFD": 3,
+    "Fonds Propres des CTD": 2, "Autres": 2, "etc": 2,
+    "BIP": 1, "FEICOM": 1,
+}
+CATEGORY_TIER = {
+    "Développement logiciel": 3,
+    "COLEPS": 2,
+    "Innovation / IA / dématérialisation": 2,
+    "Infrastructure IT": 1,
+    "Conseil / Études IT (termes génériques -- à relire)": 1,
+    "Formation digitale": 1,
+}
+RECURRENT_THRESHOLD = 3  # nombre de marchés déjà vus pour qu'un acheteur compte comme récurrent
+
+ACTION_CONTACT = "Contacter maintenant"
+ACTION_PREPARE = "Préparer le dossier"
+ACTION_WATCH = "Surveiller seulement"
+
+
+def _funding_tier(source: str) -> int:
+    return FUNDING_TIER.get((source or "").strip(), 1)
+
+
+def _category_tier(categories_str: str) -> int:
+    cats = [c.strip() for c in (categories_str or "").split(",") if c.strip()]
+    return max((CATEGORY_TIER.get(c, 1) for c in cats), default=1)
+
+
+def _urgency_tier(launch_date_value, today=None) -> int:
+    """Plus le lancement de consultation est proche, plus c'est urgent --
+    un score élevé sur un marché qui ne se lance que dans 6 mois n'appelle
+    pas la même réaction qu'un score élevé sur un marché à 5 jours."""
+    launch = parse_ppm_date(launch_date_value)
+    if launch is None:
+        return 1
+    days = (launch - (today or date.today())).days
+    if days <= 7:
+        return 3
+    if days <= 30:
+        return 2
+    return 1
+
+
+def buyer_market_counts(all_records: list[dict]) -> Counter:
+    """Combien de marchés déjà vus par acheteur (nom normalisé) -- sert à
+    repérer les acheteurs récurrents, cibles de relation long terme."""
+    counts = Counter()
+    for record in all_records:
+        authority = clean_authority_name(record.get("Autorité (en-tête de page)", ""))
+        counts[authority] += 1
+    return counts
+
+
+def compute_attractiveness(record: dict, buyer_counts: Counter) -> dict:
+    """Score = financement × catégorie × urgence, avec un bonus si
+    l'acheteur est récurrent. Renvoie aussi une action NOMMÉE, pas un chiffre
+    à interpréter -- un score seul laisse toujours la place à "je déciderai
+    plus tard"."""
+    funding = _funding_tier(record.get("Source de financement"))
+    category = _category_tier(record.get("Catégories détectées"))
+    urgency = _urgency_tier(record.get(LAUNCH_COLUMN))
+    authority = clean_authority_name(record.get("Autorité (en-tête de page)", ""))
+    recurrent = buyer_counts.get(authority, 0) >= RECURRENT_THRESHOLD
+
+    score = funding * category * urgency + (2 if recurrent else 0)
+
+    if score >= 15:
+        action = ACTION_CONTACT
+    elif score >= 8:
+        action = ACTION_PREPARE
+    else:
+        action = ACTION_WATCH
+
+    return {
+        "_score": score,
+        "_action": action,
+        "_urgent": urgency == 3,
+        "_recurrent": recurrent,
+    }
+
+
+def get_priority_opportunities(collection, limit: int = 10) -> list[dict]:
+    """Marchés encore ouverts (pas déjà attribués), classés par score
+    d'attractivité décroissant -- le panneau de décision principal de
+    l'onglet Business Intelligence. Fonctionne sur toute la mémoire, pas
+    seulement la dernière extraction en session."""
+    if collection is None:
+        return []
+    all_docs = list(collection.find({}))
+    all_records = [dict(d.get("record") or {}) for d in all_docs if d.get("record")]
+    counts = buyer_market_counts(all_records)
+
+    scored = []
+    for doc in all_docs:
+        record = dict(doc.get("record") or {})
+        if not record:
+            continue
+        enriched = {
+            **record,
+            **compute_attractiveness(record, counts),
+            "_decision": doc.get("decision"),
+            "_market_key": doc.get("_id"),
+        }
+        scored.append(enriched)
+
+    scored = filter_ongoing(scored)
+    scored.sort(key=lambda r: r["_score"], reverse=True)
+    return scored[:limit]
+
+
+def set_decision(collection, market_key_value: str, decision: str) -> None:
+    """Enregistre la décision de DAREDAB (go / no-go) sur un marché --
+    trace explicite de l'action prise, pas seulement du score affiché. Sert
+    aussi de graine de donnée de résultat pour un futur entraînement une
+    fois qu'on saura aussi si le marché a été gagné ou perdu."""
+    if collection is None or not market_key_value:
+        return
+    collection.update_one(
+        {"_id": market_key_value},
+        {"$set": {"decision": decision, "decision_at": datetime.now(timezone.utc).isoformat()}},
+    )
 
 
 @st.cache_resource(show_spinner=False)
