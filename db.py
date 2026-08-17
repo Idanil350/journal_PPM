@@ -223,12 +223,15 @@ ACTION_PREPARE = "Préparer le dossier"
 ACTION_WATCH = "Surveiller seulement"
 
 
-def _funding_tier(source: str) -> int:
-    return FUNDING_TIER.get((source or "").strip(), 1)
+def _funding_tier(source) -> int:
+    """Accepte n'importe quel type en entrée (pas seulement str) -- une
+    valeur non textuelle dans un vieux document Mongo ne doit pas planter
+    tout le panneau de priorités, juste retomber sur le palier par défaut."""
+    return FUNDING_TIER.get(str(source or "").strip(), 1)
 
 
-def _category_tier(categories_str: str) -> int:
-    cats = [c.strip() for c in (categories_str or "").split(",") if c.strip()]
+def _category_tier(categories_str) -> int:
+    cats = [c.strip() for c in str(categories_str or "").split(",") if c.strip()]
     return max((CATEGORY_TIER.get(c, 1) for c in cats), default=1)
 
 
@@ -301,9 +304,16 @@ def get_priority_opportunities(collection, limit: int = 10) -> list[dict]:
         record = dict(doc.get("record") or {})
         if not record:
             continue
+        try:
+            attractiveness = compute_attractiveness(record, counts)
+        except Exception:
+            # Un document ancien/inattendu ne doit pas faire disparaître le
+            # panneau entier -- on l'ignore, silencieusement plutôt qu'un
+            # écran d'erreur pour tout le monde.
+            continue
         enriched = {
             **record,
-            **compute_attractiveness(record, counts),
+            **attractiveness,
             "_decision": doc.get("decision"),
             "_market_key": doc.get("_id"),
         }

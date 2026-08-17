@@ -241,11 +241,14 @@ def classify_buyer_type(authority_text: str) -> str:
     return "Établissement public / Entreprise"
 
 
-def clean_authority_name(header: str) -> str:
+def clean_authority_name(header) -> str:
     """Retire le code numerique final ("... - 3700000000") de l'en-tete de
-    page pour un nom d'autorite lisible dans les tableaux de bord."""
+    page pour un nom d'autorite lisible dans les tableaux de bord. Accepte
+    n'importe quel type en entree -- une valeur non textuelle stockee par
+    erreur ne doit pas faire planter les ecrans qui en dependent."""
     if not header:
         return "(Autorité non identifiée)"
+    header = str(header)
     return re.sub(r"\s*-\s*\d{6,}\s*$", "", header).strip() or header
 
 
