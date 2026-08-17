@@ -136,7 +136,6 @@ with st.sidebar:
     hide_past = st.toggle(
         "Marchés pas encore attribués uniquement",
         value=True,
-        disabled="ppm_results" not in st.session_state,
         help=f'Basé sur la colonne "{ATTRIBUTION_COLUMN}" : un marché dont la date '
              "d'attribution prévue est déjà passée est masqué -- une fois attribué, "
              "l'opportunité de soumissionner est perdue. Les dates vides ou illisibles "
@@ -145,9 +144,9 @@ with st.sidebar:
     show_new_only = st.toggle(
         "Nouveaux et modifiés uniquement",
         value=True,
-        disabled=collection is None or "ppm_results" not in st.session_state,
-        help="Compare avec les éditions précédentes du PPM déjà chargées : masque les "
-             "marchés déjà vus et inchangés depuis la dernière fois.",
+        disabled=collection is None,
+        help="Compare avec la dernière fois que quelqu'un a consulté l'app : masque les "
+             "marchés déjà vus et inchangés. Fonctionne dès l'ouverture, sans upload.",
     )
     if collection is None:
         st.caption(
@@ -271,10 +270,12 @@ def render_history_tab():
             st.metric("Nouveautés depuis la dernière consultation", len(changes), border=True)
             if changes:
                 changes_df = results_to_dataframe(changes)
+                changes_df.insert(0, "Statut", [c.get("Statut") for c in changes])
                 st.dataframe(
                     changes_df,
                     hide_index=True,
                     column_config={
+                        "Statut": st.column_config.TextColumn(pinned=True),
                         "Désignation et localisation du projet": st.column_config.TextColumn(pinned=True),
                         "Montant prévisionnel (FCFA)": st.column_config.NumberColumn(format="%d"),
                     },
@@ -287,6 +288,15 @@ def render_history_tab():
                     icon=":material/download:",
                     key="dl_changes",
                 )
+
+                modified = [c for c in changes if c.get("Statut") == db.STATUS_UPDATED and c.get("_diff")]
+                if modified:
+                    st.markdown("**Détail des modifications** -- quel champ a changé, et vers quoi :")
+                    for m in modified:
+                        title = m.get("Désignation et localisation du projet", "")[:80]
+                        with st.expander(f":material/edit: {title}"):
+                            for d in m["_diff"]:
+                                st.markdown(f"- **{d['champ']}** : {d['avant']} → {d['après']}")
             else:
                 st.info("Rien de nouveau depuis la dernière consultation.", icon=":material/task_alt:")
 
@@ -332,40 +342,35 @@ def render_history_tab():
                 st.info("Aucun projet avec un lancement de consultation prévu depuis cette date.", icon=":material/task_alt:")
 
         with st.container(border=True):
-            st.subheader("Marchés jamais vus par DAREDAB depuis une date")
+            st.subheader("Tous les projets IT connus")
             st.caption(
-                "Autre question, différente de celle ci-dessus : quels marchés IT DAREDAB n'avait "
-                "encore jamais détectés dans aucune édition précédente du PPM."
+                "L'ensemble des marchés IT actuellement en mémoire, toutes éditions du "
+                "journal confondues -- pas besoin d'avoir chargé un journal dans cette session."
             )
-            since_seen = st.date_input(
-                "Jamais vu depuis quelle date", key="since_seen",
-                value=date.today() - timedelta(days=14), format="DD/MM/YYYY",
-            )
-            seen_results = db.get_markets_since(collection, since_seen)
-            st.metric(
-                f"Marchés jamais vus, détectés depuis le {since_seen.strftime('%d/%m/%Y')}",
-                len(seen_results), border=True,
-            )
-            if seen_results:
-                seen_df = results_to_dataframe(seen_results)
+            all_markets = db.get_all_markets(collection, last_consultation)
+            st.metric("Projets IT en mémoire", len(all_markets), border=True)
+            if all_markets:
+                all_df = results_to_dataframe(all_markets)
+                all_df.insert(0, "Statut", [m.get("Statut") for m in all_markets])
                 st.dataframe(
-                    seen_df,
+                    all_df,
                     hide_index=True,
                     column_config={
+                        "Statut": st.column_config.TextColumn(pinned=True),
                         "Désignation et localisation du projet": st.column_config.TextColumn(pinned=True),
                         "Montant prévisionnel (FCFA)": st.column_config.NumberColumn(format="%d"),
                     },
                 )
                 st.download_button(
                     "Télécharger en Excel",
-                    data=to_excel_bytes(seen_df),
-                    file_name=f"nouveaux_marches_depuis_{since_seen.isoformat()}.xlsx",
+                    data=to_excel_bytes(all_df),
+                    file_name="tous_les_projets_it.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     icon=":material/download:",
-                    key="dl_seen",
+                    key="dl_all",
                 )
             else:
-                st.info("Aucun nouveau marché détecté depuis cette date.", icon=":material/task_alt:")
+                st.info("Aucun projet IT en mémoire pour l'instant.", icon=":material/task_alt:")
 
 
 with tab_bi:
@@ -421,21 +426,32 @@ if uploaded_file is not None:
             st.session_state["ppm_results"] = tagged_accumulator
             st.session_state["ppm_total_pages"] = total_pages
             st.session_state["ppm_edition_date"] = edition_date
+            if not tagged_accumulator:
+                st.warning(f"{total_pages} pages analysées -- aucune ligne ne correspond aux mots-clés IT/COLEPS.")
         finally:
             tmp_path.unlink(missing_ok=True)
 
-# Les résultats vivent dans session_state, indépendamment du widget d'upload
-# -- rechoisir/effacer le fichier ne fait pas disparaître la dernière analyse.
-if "ppm_results" not in st.session_state:
-    st.info("Dépose un fichier PDF ci-dessus pour lancer l'extraction.", icon=":material/upload_file:")
-    st.stop()
-
-results = st.session_state["ppm_results"]
-total_pages = st.session_state["ppm_total_pages"]
+# Affichage principal : toujours depuis la mémoire persistante (pas depuis
+# la session en cours) -- pour que les filtres marchent dès l'ouverture de
+# l'app, sans upload, et restent cohérents avec l'onglet Historique (même
+# repère "dernière consultation" partagé). Repli sur les résultats de cette
+# session seulement si MONGO_URI n'est pas configuré du tout.
+meta_collection = db.get_meta_collection()
+last_consultation = db.get_last_consultation(meta_collection)
+total_pages = st.session_state.get("ppm_total_pages")
 edition_date = st.session_state.get("ppm_edition_date")
 
+if collection is not None:
+    results = db.get_all_markets(collection, last_consultation)
+else:
+    results = st.session_state.get("ppm_results")
+
 if not results:
-    st.warning(f"{total_pages} pages analysées -- aucune ligne ne correspond aux mots-clés IT/COLEPS.")
+    st.info(
+        "Aucun marché IT en mémoire pour l'instant -- dépose un PDF ci-dessus pour lancer "
+        "une première extraction.",
+        icon=":material/upload_file:",
+    )
     st.stop()
 
 hidden_count = 0
@@ -451,10 +467,6 @@ if hide_past:
         )
         st.stop()
 
-# Le statut Nouveau/Modifié/Déjà vu a déjà été calculé et enregistré lot par
-# lot pendant l'extraction (voir on_batch ci-dessus) -- pas besoin de
-# reclassifier ici, ça compterait tout comme "déjà vu" puisque ça vient
-# d'être stocké. On se contente de compter/filtrer sur le Statut déjà présent.
 new_count = updated_count = None
 if collection is not None:
     new_count = sum(1 for r in results if r.get("Statut") == db.STATUS_NEW)
@@ -464,8 +476,8 @@ if collection is not None:
         results = [r for r in results if r.get("Statut") in (db.STATUS_NEW, db.STATUS_UPDATED)]
         if not results:
             st.info(
-                f"Les {before_new_filter} marché(s) IT retenus sont déjà connus et inchangés "
-                "depuis la dernière édition chargée. Désactive le filtre dans la barre latérale "
+                f"Les {before_new_filter} marché(s) IT en mémoire sont déjà connus et inchangés "
+                "depuis la dernière consultation. Désactive le filtre dans la barre latérale "
                 "pour les revoir.",
                 icon=":material/task_alt:",
             )
@@ -475,19 +487,20 @@ analytics = PPMAnalytics(results)
 kpis = analytics.kpis()
 
 with st.container(horizontal=True):
-    st.metric("Pages analysées", f"{total_pages:,}".replace(",", " "), border=True)
+    if total_pages is not None:
+        st.metric("Pages analysées (dernier upload)", f"{total_pages:,}".replace(",", " "), border=True)
     st.metric("Marchés IT retenus", kpis["lignes"], border=True)
     st.metric("Autorités distinctes", kpis["autorites"], border=True)
     st.metric("Budget total identifié", fmt_fcfa(kpis["budget_total"]), border=True)
     if new_count is not None:
-        st.metric("Nouveaux depuis la dernière édition", new_count, border=True)
+        st.metric("Nouveaux/modifiés depuis la dernière consultation", new_count + updated_count, border=True)
 
 if edition_date:
     st.caption(
         f":material/event: Édition du PPM détectée : {edition_date.strftime('%d/%m/%Y')} -- "
         "c'est cette date qui sert de référence pour le suivi des nouveautés, pas la date d'upload."
     )
-elif collection is not None:
+elif collection is not None and total_pages is not None:
     st.caption(
         ":material/warning: Date de l'édition introuvable dans ce PDF -- la date d'upload est "
         "utilisée en repli pour le suivi des nouveautés (moins fiable si l'upload est tardif)."

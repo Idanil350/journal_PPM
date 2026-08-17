@@ -19,7 +19,13 @@ import streamlit as st
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
 
-from ppm_extraction import ATTRIBUTION_COLUMN, clean_authority_name, filter_ongoing, parse_ppm_date
+from ppm_extraction import (
+    ATTRIBUTION_COLUMN,
+    TABLE_COLUMNS,
+    clean_authority_name,
+    filter_ongoing,
+    parse_ppm_date,
+)
 
 LAUNCH_COLUMN = "Lancement de consultation / Invitation à soumissionner"
 
@@ -27,11 +33,16 @@ STATUS_NEW = "Nouveau"
 STATUS_UPDATED = "Modifié"
 STATUS_SEEN = "Déjà vu"
 
-_SNAPSHOT_FIELDS = [
-    "Montant prévisionnel (FCFA)",
-    ATTRIBUTION_COLUMN,
-    "Lancement de consultation / Invitation à soumissionner",
-]
+# Toutes les colonnes du tableau sauf "N°" (position dans CETTE édition, pas
+# un identifiant -- déjà exclu de l'identité du marché) et la désignation
+# (sert à l'identité elle-même ; une reformulation mineure y est déjà
+# tolérée par la normalisation dans market_key, la comparer ici créerait du
+# bruit). Toute autre colonne -- autorité contractante compétente, mode de
+# consultation, dates, montant, source de financement -- peut légitimement
+# changer d'une édition à l'autre (ex: le maître d'ouvrage réel du dossier,
+# pas l'en-tête de page qui lui ne change jamais) sous l'effet de facteurs
+# politiques/économiques, et doit compter comme une vraie modification.
+_SNAPSHOT_FIELDS = [c for c in TABLE_COLUMNS if c not in ("N°", "Désignation et localisation du projet")]
 
 
 def _normalize(text: str) -> str:
@@ -56,6 +67,20 @@ def market_key(record: dict) -> str:
 def _snapshot(record: dict) -> dict:
     """Champs dont le changement doit déclencher le statut "Modifié"."""
     return {field: record.get(field) for field in _SNAPSHOT_FIELDS}
+
+
+def _diff_fields(old_snapshot: dict, new_snapshot: dict) -> list[dict]:
+    """Liste des champs qui ont réellement changé entre deux instantanés,
+    avec la valeur avant et après -- pour répondre précisément à "qu'est-ce
+    qui a changé", pas juste "quelque chose a changé"."""
+    old_snapshot = old_snapshot or {}
+    changes = []
+    for field in _SNAPSHOT_FIELDS:
+        before = old_snapshot.get(field)
+        after = new_snapshot.get(field)
+        if before != after:
+            changes.append({"champ": field, "avant": before or "—", "après": after or "—"})
+    return changes
 
 
 def classify_and_store(collection, results: list[dict], edition_date=None) -> list[dict]:
@@ -87,24 +112,64 @@ def classify_and_store(collection, results: list[dict], edition_date=None) -> li
         snapshot = _snapshot(record)
         existing = collection.find_one({"_id": key})
 
+        diff = []
         if existing is None:
             status = STATUS_NEW
         elif existing.get("snapshot") != snapshot:
             status = STATUS_UPDATED
+            diff = _diff_fields(existing.get("snapshot"), snapshot)
         else:
             status = STATUS_SEEN
 
         set_fields = {"snapshot": snapshot, "record": record, "last_seen": reference}
         if status in (STATUS_NEW, STATUS_UPDATED):
+            # last_status est stocké explicitement (pas redéduit d'une
+            # comparaison de dates) -- first_seen suit l'horloge de
+            # l'édition, last_changed l'horloge réelle, les deux ne
+            # coïncident presque jamais même pour un marché tout juste créé.
             set_fields["last_changed"] = processed_at
+            set_fields["last_status"] = status
+        if status == STATUS_UPDATED:
+            set_fields["last_diff"] = diff
 
         collection.update_one(
             {"_id": key},
             {"$set": set_fields, "$setOnInsert": {"first_seen": reference}},
             upsert=True,
         )
-        tagged.append({**record, "Statut": status})
+        tagged.append({**record, "Statut": status, "_diff": diff})
     return tagged
+
+
+def get_all_markets(collection, last_consultation=None) -> list[dict]:
+    """Tous les marchés actuellement en mémoire, avec un statut Nouveau/
+    Modifié/Déjà vu calculé à partir des données déjà stockées -- sans
+    avoir besoin d'une extraction fraîche dans la session en cours. C'est
+    ce qui permet aux filtres de la barre latérale (marchés en cours,
+    nouveaux/modifiés) de fonctionner dès l'ouverture de l'app, avant même
+    un premier upload.
+
+    `last_status` (Nouveau/Modifié) n'est réutilisé que si `last_changed`
+    est postérieur à `last_consultation` -- sinon un marché resterait
+    étiqueté "Modifié" indéfiniment après avoir été vu une fois, même si
+    plus rien n'a changé depuis."""
+    if collection is None:
+        return []
+    checkpoint = last_consultation or ""
+    results = []
+    for doc in collection.find({}):
+        record = dict(doc.get("record") or {})
+        if not record:
+            continue
+        last_changed = doc.get("last_changed") or ""
+        status = (doc.get("last_status") or STATUS_SEEN) if last_changed > checkpoint else STATUS_SEEN
+        results.append({
+            **record,
+            "Statut": status,
+            "_diff": doc.get("last_diff") or [],
+            "_market_key": doc.get("_id"),
+        })
+    return results
 
 
 def get_markets_since(collection, since_date) -> list[dict]:
@@ -142,6 +207,8 @@ def get_changes_since(collection, since_key) -> list[dict]:
     for doc in docs:
         record = dict(doc.get("record") or {})
         record["_last_changed"] = doc.get("last_changed")
+        record["Statut"] = doc.get("last_status") or STATUS_UPDATED
+        record["_diff"] = doc.get("last_diff") or []
         results.append(record)
     return results
 
